@@ -1,0 +1,19 @@
+[project]
+name = "ErisPulse-WeComAdapter"
+version = "0.1.0"
+description = "ErisPulse的企业微信(WeCom)适配模块"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [ { name = "ErisPulse" } ]
+dependencies = ["cryptography"]
+
+[project.urls]
+"homepage" = "https://github.com/ErisPulse/ErisPulse-WeComAdapter"
+
+[project.entry-points."erispulse.adapter"]
+wecom = "WeComAdapter:WeComAdapter"
+wxwork = "WeComAdapter:WeComAdapter"
+
+[tool.setuptools.packages.find]
+include = [ "WeComAdapter" ]
