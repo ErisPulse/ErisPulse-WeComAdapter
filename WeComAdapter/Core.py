@@ -19,7 +19,7 @@ from ErisPulse.Core.Bases.config_schema import dict_to_dataclass
 
 from .Converter import WeComConverter
 
-__version__ = "0.1.0"
+__version__ = "2.1.0"
 
 # 软依赖的框架最低版本（运行时检测，仅提示不强制）
 MIN_FRAMEWORK_VERSION = (2, 7, 1)
@@ -83,13 +83,26 @@ class WeComAccountConfig(BotAccountConfig):
             "ui": {"widget": "number", "group": "basic", "order": 3},
         },
     )
+    callback_enabled: bool = field(
+        default=True,
+        metadata={
+            "description": "启用回调接收（关闭后仅能主动发送，无法接收消息）",
+            "required": False,
+            "ui": {"widget": "switch", "group": "callback", "order": 3},
+        },
+    )
     token: str = field(
         default="",
         metadata={
             "description": "回调验证 Token（企业微信后台设置的 Token）",
             "required": False,
             "secret": True,
-            "ui": {"widget": "password", "group": "callback", "order": 4},
+            "ui": {
+                "widget": "password",
+                "group": "callback",
+                "order": 4,
+                "show_if": {"field": "callback_enabled", "op": "eq", "value": True},
+            },
         },
     )
     encoding_aes_key: str = field(
@@ -98,7 +111,12 @@ class WeComAccountConfig(BotAccountConfig):
             "description": "回调加解密密钥 EncodingAESKey（43位）",
             "required": False,
             "secret": True,
-            "ui": {"widget": "password", "group": "callback", "order": 5},
+            "ui": {
+                "widget": "password",
+                "group": "callback",
+                "order": 5,
+                "show_if": {"field": "callback_enabled", "op": "eq", "value": True},
+            },
         },
     )
     callback_path: str = field(
@@ -106,7 +124,12 @@ class WeComAccountConfig(BotAccountConfig):
         metadata={
             "description": "回调接收路径，支持 {account} 占位符",
             "required": False,
-            "ui": {"widget": "text", "group": "callback", "order": 6},
+            "ui": {
+                "widget": "text",
+                "group": "callback",
+                "order": 6,
+                "show_if": {"field": "callback_enabled", "op": "eq", "value": True},
+            },
         },
     )
 
@@ -359,6 +382,45 @@ class WeComAdapter(BaseAdapter):
 
             return self._adapter.make_response(
                 data={"impl": "ErisPulse-WeComAdapter", "version": __version__, "onebot_version": "12"}
+            )
+
+        async def get_user_info(self, user_id: str, *, account_id: str = None) -> dict:
+            """获取成员详细信息（姓名/部门/职务/头像等，GET user/get）"""
+            return await self._adapter.call_api(
+                "user/get", _account_id=account_id, userid=str(user_id)
+            )
+
+        async def get_department_list(self, department_id: int = 0, *, account_id: str = None) -> dict:
+            """获取部门列表（department_id=0 取根部门，GET department/list）"""
+            return await self._adapter.call_api(
+                "department/list", _account_id=account_id, id=int(department_id)
+            )
+
+        async def get_department_users(self, department_id: int, *, fetch_child: int = 0, account_id: str = None) -> dict:
+            """获取部门成员列表（GET user/simplelist）"""
+            return await self._adapter.call_api(
+                "user/simplelist",
+                _account_id=account_id,
+                department_id=int(department_id),
+                fetch_child=int(fetch_child),
+            )
+
+        async def get_user_by_mobile(self, mobile: str, *, account_id: str = None) -> dict:
+            """手机号查成员 userid（POST user/get_userid）"""
+            return await self._adapter.call_api(
+                "user/get_userid", _account_id=account_id, mobile=str(mobile)
+            )
+
+        async def userid_to_openid(self, user_id: str, *, account_id: str = None) -> dict:
+            """成员 userid 转 openid（红包/对外支付等场景，POST user/convert_to_openid）"""
+            return await self._adapter.call_api(
+                "user/convert_to_openid", _account_id=account_id, userid=str(user_id)
+            )
+
+        async def openid_to_userid(self, openid: str, *, account_id: str = None) -> dict:
+            """openid 转回成员 userid（POST user/convert_to_userid）"""
+            return await self._adapter.call_api(
+                "user/convert_to_userid", _account_id=account_id, openid=str(openid)
             )
 
         async def get_supported_actions(self) -> dict:
@@ -1014,6 +1076,13 @@ class WeComAdapter(BaseAdapter):
             converter = WeComConverter("wecom")
             converter.set_bot_id(account.corpid)
             self._converters[account_name] = converter
+
+            if not getattr(account, "callback_enabled", True):
+                self.logger.info(
+                    f"账户 {account_name} 回调接收已关闭（仅主动发送模式）"
+                )
+                await self.emit_meta("connect", account.corpid, user_name=account_name)
+                continue
 
             path = account.callback_path or f"/wecom/{account_name}"
 
