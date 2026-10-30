@@ -19,7 +19,7 @@ from ErisPulse.Core.Bases.config_schema import dict_to_dataclass
 
 from .Converter import WeComConverter
 
-__version__ = "2.1.0"
+__version__ = "0.1.0"
 
 # 软依赖的框架最低版本（运行时检测，仅提示不强制）
 MIN_FRAMEWORK_VERSION = (2, 7, 1)
