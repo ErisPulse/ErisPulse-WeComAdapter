@@ -6,7 +6,7 @@
 
 # ErisPulse-WeComAdapter
 
-**ErisPulse adapter for WeCom — callback receive, app messages & contacts API**
+**ErisPulse 企业微信适配器 — 回调接收、应用消息与通讯录 API**
 
 <p>
   <a href="https://pypi.org/project/ErisPulse-WeComAdapter/"><img src="https://img.shields.io/pypi/v/ErisPulse-WeComAdapter?style=for-the-badge&logo=pypi&logoColor=white" alt="PyPI"></a>
