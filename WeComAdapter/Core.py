@@ -3,9 +3,12 @@ import base64
 import hashlib
 import io
 import json
+import os
+import re
 import socket
 import struct
 import time
+import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -19,7 +22,7 @@ from ErisPulse.Core.Bases.config_schema import dict_to_dataclass
 
 from .Converter import WeComConverter
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # 软依赖的框架最低版本（运行时检测，仅提示不强制）
 MIN_FRAMEWORK_VERSION = (2, 7, 1)
@@ -239,7 +242,9 @@ class WeComAdapter(BaseAdapter):
                 return self.Raw_ob12(
                     [{"type": "file", "data": {"_raw_bytes": file, "file": filename}}]
                 )
-            return self.Raw_ob12([{"type": "file", "data": {"file": file}}])
+            return self.Raw_ob12(
+                [{"type": "file", "data": {"file": file, "filename": filename}}]
+            )
 
         def News(self, articles: List[Dict]):
             """发送图文消息
@@ -655,189 +660,301 @@ class WeComAdapter(BaseAdapter):
             endpoint = "message/send"
 
         # 从消息段中提取发送内容
-        payload = await self._build_wecom_payload(
+        payloads = await self._build_wecom_payloads(
             account_name, segments, target_param, account.agentid
         )
-        if payload is None:
+        if not payloads:
             return self.make_error(
                 retcode=34000,
                 message="无法从消息段构建企业微信消息",
                 raw=None,
             )
 
-        return await self.call_api(endpoint, _account_id=account_name, **payload)
+        result = None
+        for payload in payloads:
+            result = await self.call_api(endpoint, _account_id=account_name, **payload)
+            if result.get("status") == "failed":
+                return result
+        return result
 
-    async def _build_wecom_payload(
+    @staticmethod
+    def _is_media_id(value: str) -> bool:
+        """判断字符串是否形似企业微信 media_id（排除 URL/file:/data:/裸 base64/路径形态）"""
+        if not value:
+            return False
+        if value.startswith(("http://", "https://", "file://", "file:", "data:")):
+            return False
+        if (
+            len(value) >= 256
+            and len(value) % 4 == 0
+            and re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", value)
+        ):
+            return False
+        if "/" in value or "\\" in value:
+            return False
+        return True
+
+    @staticmethod
+    def _media_ref_filename(ref: str, fallback: str) -> str:
+        """从媒体引用提取上传文件名；data:/裸 base64 无法提取，返回 fallback"""
+        if ref.startswith("file://"):
+            ref = ref[len("file://"):]
+        elif ref.startswith("file:"):
+            ref = ref[len("file:"):]
+        if ref.startswith(("http://", "https://")):
+            return os.path.basename(ref.split("?", 1)[0].split("#", 1)[0]) or fallback
+        if ref.startswith("data:"):
+            return fallback
+        if (
+            len(ref) >= 256
+            and len(ref) % 4 == 0
+            and re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", ref)
+        ):
+            return fallback
+        return os.path.basename(ref) or fallback
+
+    async def _fetch_media_bytes(self, ref: str) -> Optional[bytes]:
+        """将 URL / file:// / 本地路径 / data: URI / 裸 base64 解析为 bytes"""
+        if ref.startswith(("http://", "https://")):
+            try:
+                resp = await client.get(ref)
+                return await resp.read()
+            except Exception as e:
+                self.logger.error(f"下载媒体文件失败: {ref}: {e}")
+                return None
+        if ref.startswith("file://"):
+            ref = ref[len("file://"):]
+        elif ref.startswith("file:"):
+            ref = ref[len("file:"):]
+        if os.path.isfile(ref):
+            try:
+                with open(ref, "rb") as f:
+                    return f.read()
+            except Exception as e:
+                self.logger.error(f"读取本地媒体文件失败: {ref}: {e}")
+                return None
+        if ref.startswith("data:"):
+            header, _, payload = ref.partition(",")
+            try:
+                if "base64" in header:
+                    return base64.b64decode(payload)
+                return urllib.parse.unquote(payload).encode("utf-8")
+            except Exception as e:
+                self.logger.error(f"解码 data: URI 失败: {e}")
+                return None
+        if (
+            len(ref) >= 256
+            and len(ref) % 4 == 0
+            and re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", ref)
+        ):
+            try:
+                return base64.b64decode(ref, validate=True)
+            except Exception:
+                return None
+        return None
+
+    async def _ensure_media_id(
+        self,
+        account_name: str,
+        ref: str,
+        media_type: str,
+        filename: Optional[str] = None,
+        default_name: str = "",
+    ) -> Optional[str]:
+        """将媒体引用解析为 media_id；形似 media_id 的字符串直接使用，其余解析为 bytes 后上传"""
+        if not isinstance(ref, str) or not ref:
+            return None
+        if self._is_media_id(ref):
+            return ref
+        data = await self._fetch_media_bytes(ref)
+        if data is None:
+            return None
+        name = filename or self._media_ref_filename(ref, default_name)
+        return await self._upload_media(account_name, data, name, media_type)
+
+    async def _build_wecom_payloads(
         self, account_name: str, segments: List[Dict], base: Dict, agentid: int
-    ) -> Optional[Dict]:
-        """将 OneBot12 消息段列表转换为企业微信发送体"""
+    ) -> Optional[List[Dict]]:
+        """将 OneBot12 消息段列表按序拆分为企业微信发送体列表"""
         if not segments:
             return None
 
-        # 找出主消息段（第一个非 mention/reply）
-        main_seg = None
+        payloads: List[Dict] = []
         text_parts: List[str] = []
+
+        def _flush_text():
+            text = "".join(text_parts)
+            text_parts.clear()
+            if text:
+                payloads.append(
+                    {
+                        **base,
+                        "msgtype": "text",
+                        "agentid": agentid,
+                        "text": {"content": text},
+                        "safe": 0,
+                    }
+                )
+
         for seg in segments:
             seg_type = seg.get("type", "")
             data = seg.get("data", {})
+
             if seg_type == "text":
                 text_parts.append(data.get("text", ""))
-            elif main_seg is None and seg_type not in (
-                "mention",
-                "mention_all",
-                "reply",
-            ):
-                main_seg = seg
+                continue
 
-        # 所有内容都是纯文本
-        if main_seg is None:
-            full_text = "".join(text_parts)
-            if not full_text:
-                full_text = " "
-            return {
-                **base,
-                "msgtype": "text",
-                "agentid": agentid,
-                "text": {"content": full_text},
-                "safe": 0,
-            }
+            if seg_type in ("mention", "mention_all", "reply"):
+                self.logger.warning(f"企业微信不支持 {seg_type} 段，已忽略")
+                continue
 
-        seg_type = main_seg.get("type", "")
-        data = main_seg.get("data", {})
+            _flush_text()
 
-        # 如果主段是文本，但仍可能有其他文本段，合并
-        if seg_type == "text":
-            full_text = "".join(text_parts) or data.get("text", " ")
-            return {
-                **base,
-                "msgtype": "text",
-                "agentid": agentid,
-                "text": {"content": full_text},
-                "safe": 0,
-            }
-
-        if seg_type == "image":
-            raw_bytes = data.get("_raw_bytes")
-            if raw_bytes:
-                media_id = await self._upload_media(
-                    account_name, raw_bytes, data.get("file", "image.png"), "image"
-                )
+            if seg_type == "image":
+                raw_bytes = data.get("_raw_bytes")
+                if raw_bytes:
+                    media_id = await self._upload_media(
+                        account_name, raw_bytes, data.get("file", "image.png"), "image"
+                    )
+                else:
+                    media_id = await self._ensure_media_id(
+                        account_name,
+                        data.get("file", "") or data.get("file_id", ""),
+                        "image",
+                        default_name="image.png",
+                    )
                 if not media_id:
                     return None
-            else:
-                media_id = data.get("file", "") or data.get("file_id", "")
-            return {
-                **base,
-                "msgtype": "image",
-                "agentid": agentid,
-                "image": {"media_id": media_id},
-            }
-
-        if seg_type == "audio":
-            raw_bytes = data.get("_raw_bytes")
-            if raw_bytes:
-                media_id = await self._upload_media(
-                    account_name, raw_bytes, data.get("file", "voice.amr"), "voice"
+                payloads.append(
+                    {**base, "msgtype": "image", "agentid": agentid, "image": {"media_id": media_id}}
                 )
+                continue
+
+            if seg_type == "audio":
+                raw_bytes = data.get("_raw_bytes")
+                if raw_bytes:
+                    media_id = await self._upload_media(
+                        account_name, raw_bytes, data.get("file", "voice.amr"), "voice"
+                    )
+                else:
+                    media_id = await self._ensure_media_id(
+                        account_name,
+                        data.get("file", "") or data.get("file_id", ""),
+                        "voice",
+                        default_name="voice.amr",
+                    )
                 if not media_id:
                     return None
-            else:
-                media_id = data.get("file", "") or data.get("file_id", "")
-            return {
-                **base,
-                "msgtype": "voice",
-                "agentid": agentid,
-                "voice": {"media_id": media_id},
-            }
-
-        if seg_type == "video":
-            raw_bytes = data.get("_raw_bytes")
-            if raw_bytes:
-                media_id = await self._upload_media(
-                    account_name, raw_bytes, data.get("file", "video.mp4"), "video"
+                payloads.append(
+                    {**base, "msgtype": "voice", "agentid": agentid, "voice": {"media_id": media_id}}
                 )
+                continue
+
+            if seg_type == "video":
+                raw_bytes = data.get("_raw_bytes")
+                if raw_bytes:
+                    media_id = await self._upload_media(
+                        account_name, raw_bytes, data.get("file", "video.mp4"), "video"
+                    )
+                else:
+                    media_id = await self._ensure_media_id(
+                        account_name,
+                        data.get("file", "") or data.get("file_id", ""),
+                        "video",
+                        default_name="video.mp4",
+                    )
                 if not media_id:
                     return None
-            else:
-                media_id = data.get("file", "") or data.get("file_id", "")
-            return {
-                **base,
-                "msgtype": "video",
-                "agentid": agentid,
-                "video": {"media_id": media_id},
-            }
-
-        if seg_type == "file":
-            raw_bytes = data.get("_raw_bytes")
-            if raw_bytes:
-                media_id = await self._upload_media(
-                    account_name, raw_bytes, data.get("file", "file.bin"), "file"
+                payloads.append(
+                    {**base, "msgtype": "video", "agentid": agentid, "video": {"media_id": media_id}}
                 )
+                continue
+
+            if seg_type == "file":
+                raw_bytes = data.get("_raw_bytes")
+                if raw_bytes:
+                    media_id = await self._upload_media(
+                        account_name, raw_bytes, data.get("file", "file.bin"), "file"
+                    )
+                else:
+                    media_id = await self._ensure_media_id(
+                        account_name,
+                        data.get("file", "") or data.get("file_id", ""),
+                        "file",
+                        filename=data.get("filename"),
+                        default_name="file.bin",
+                    )
                 if not media_id:
                     return None
-            else:
-                media_id = data.get("file", "") or data.get("file_id", "")
-            return {
-                **base,
-                "msgtype": "file",
-                "agentid": agentid,
-                "file": {"media_id": media_id},
-            }
+                payloads.append(
+                    {**base, "msgtype": "file", "agentid": agentid, "file": {"media_id": media_id}}
+                )
+                continue
 
-        if seg_type == "wecom_markdown":
-            return {
-                **base,
-                "msgtype": "markdown",
-                "agentid": agentid,
-                "markdown": {"content": data.get("content", "")},
-            }
+            if seg_type == "wecom_markdown":
+                payloads.append(
+                    {
+                        **base,
+                        "msgtype": "markdown",
+                        "agentid": agentid,
+                        "markdown": {"content": data.get("content", "")},
+                    }
+                )
+                continue
 
-        if seg_type == "wecom_news":
-            return {
-                **base,
-                "msgtype": "news",
-                "agentid": agentid,
-                "news": {"articles": data.get("articles", [])},
-            }
+            if seg_type == "wecom_news":
+                payloads.append(
+                    {
+                        **base,
+                        "msgtype": "news",
+                        "agentid": agentid,
+                        "news": {"articles": data.get("articles", [])},
+                    }
+                )
+                continue
 
-        if seg_type == "wecom_textcard":
-            return {
-                **base,
-                "msgtype": "textcard",
-                "agentid": agentid,
-                "textcard": {
-                    "title": data.get("title", ""),
-                    "description": data.get("description", ""),
-                    "url": data.get("url", ""),
-                    "btntxt": data.get("btntxt", "详情"),
-                },
-            }
+            if seg_type == "wecom_textcard":
+                payloads.append(
+                    {
+                        **base,
+                        "msgtype": "textcard",
+                        "agentid": agentid,
+                        "textcard": {
+                            "title": data.get("title", ""),
+                            "description": data.get("description", ""),
+                            "url": data.get("url", ""),
+                            "btntxt": data.get("btntxt", "详情"),
+                        },
+                    }
+                )
+                continue
 
-        if seg_type == "wecom_miniprogram_notice":
-            return {
-                **base,
-                "msgtype": "miniprogram_notice",
-                "agentid": agentid,
-                "miniprogram_notice": data,
-            }
+            if seg_type == "wecom_miniprogram_notice":
+                payloads.append(
+                    {
+                        **base,
+                        "msgtype": "miniprogram_notice",
+                        "agentid": agentid,
+                        "miniprogram_notice": data,
+                    }
+                )
+                continue
 
-        if seg_type == "wecom_template_card":
-            return {
-                **base,
-                "msgtype": "template_card",
-                "agentid": agentid,
-                "template_card": data,
-            }
+            if seg_type == "wecom_template_card":
+                payloads.append(
+                    {
+                        **base,
+                        "msgtype": "template_card",
+                        "agentid": agentid,
+                        "template_card": data,
+                    }
+                )
+                continue
 
-        # 兜底：作为文本发送
-        full_text = "".join(text_parts) or seg_type
-        return {
-            **base,
-            "msgtype": "text",
-            "agentid": agentid,
-            "text": {"content": full_text},
-            "safe": 0,
-        }
+            self.logger.warning(f"忽略不支持的消息段: {seg_type}")
+
+        _flush_text()
+        return payloads or None
 
     # ─────────── 加解密与签名 ───────────
 
