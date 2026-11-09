@@ -15,7 +15,7 @@ class WeComConverter(BaseConverter):
     """
 
     def __init__(self, platform: str = "wecom"):
-        self.platform = platform
+        super().__init__(platform)
         # 机器人自身标识，默认空字符串；可由 Core 设置为 corpid
         self._bot_id: str = ""
 
@@ -58,21 +58,17 @@ class WeComConverter(BaseConverter):
 
         bot_id = self._bot_id or corpid
 
-        base: Dict = {
-            "id": str(msg_id),
-            "time": create_time,
-            "platform": self.platform,
-            "self": {
-                "platform": self.platform,
-                "user_id": str(bot_id),
-            },
-            "wecom_raw": dict(data),
-            "wecom_raw_type": msg_type or "unknown",
-            "wecom_raw_xml": raw_xml,
-            "wecom_agentid": str(agent_id) if agent_id else "",
-            "wecom_corpid": str(corpid) if corpid else "",
-            "wecom_msg_id": str(msg_id) if msg_id else "",
-        }
+        # 复用 BaseConverter.build_base_event 构建公共字段（id/time/platform/self/wecom_raw）
+        base: Dict = self.build_base_event(
+            {"event_id": str(msg_id), "timestamp": create_time, "bot_id": str(bot_id)},
+            msg_type or "unknown",
+        )
+        base["wecom_raw"] = dict(data)
+        base["message_id"] = str(msg_id)
+        base["wecom_raw_xml"] = raw_xml
+        base["wecom_agentid"] = str(agent_id) if agent_id else ""
+        base["wecom_corpid"] = str(corpid) if corpid else ""
+        base["wecom_msg_id"] = str(msg_id) if msg_id else ""
 
         if msg_type == "event":
             return self._convert_event(data, base, from_user)

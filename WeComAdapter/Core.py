@@ -22,7 +22,7 @@ from ErisPulse.Core.Bases.config_schema import dict_to_dataclass
 
 from .Converter import WeComConverter
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 # 软依赖的框架最低版本（运行时检测，仅提示不强制）
 MIN_FRAMEWORK_VERSION = (2, 7, 1)
@@ -368,6 +368,7 @@ class WeComAdapter(BaseAdapter):
                 data={
                     "user_id": str(account.corpid),
                     "user_name": f"wecom:{account_name}",
+                    "user_displayname": f"wecom:{account_name}",
                     "agentid": str(getattr(account, "agentid", "")),
                 }
             )
@@ -391,21 +392,32 @@ class WeComAdapter(BaseAdapter):
 
         async def get_user_info(self, user_id: str, *, account_id: str = None) -> dict:
             """获取成员详细信息（姓名/部门/职务/头像等，GET user/get）"""
-            return await self._adapter.call_api(
-                "user/get", _account_id=account_id, userid=str(user_id)
+            # account_id 缺省时回落到 Using 指定的账户，避免忽略 Using
+            result = await self._adapter.call_api(
+                "user/get", _account_id=account_id or self._account_id, userid=str(user_id)
             )
+            # 标准化字段：userid/name → user_id/user_name/user_displayname（原始保留在 wecom_raw）
+            if result.get("status") == "ok":
+                raw = result.get("data")
+                if isinstance(raw, dict) and "userid" in raw:
+                    result["data"] = {
+                        "user_id": str(raw.get("userid", "")),
+                        "user_name": str(raw.get("name", "")),
+                        "user_displayname": str(raw.get("alias") or raw.get("name", "")),
+                    }
+            return result
 
         async def get_department_list(self, department_id: int = 0, *, account_id: str = None) -> dict:
             """获取部门列表（department_id=0 取根部门，GET department/list）"""
             return await self._adapter.call_api(
-                "department/list", _account_id=account_id, id=int(department_id)
+                "department/list", _account_id=account_id or self._account_id, id=int(department_id)
             )
 
         async def get_department_users(self, department_id: int, *, fetch_child: int = 0, account_id: str = None) -> dict:
             """获取部门成员列表（GET user/simplelist）"""
             return await self._adapter.call_api(
                 "user/simplelist",
-                _account_id=account_id,
+                _account_id=account_id or self._account_id,
                 department_id=int(department_id),
                 fetch_child=int(fetch_child),
             )
@@ -413,19 +425,19 @@ class WeComAdapter(BaseAdapter):
         async def get_user_by_mobile(self, mobile: str, *, account_id: str = None) -> dict:
             """手机号查成员 userid（POST user/get_userid）"""
             return await self._adapter.call_api(
-                "user/get_userid", _account_id=account_id, mobile=str(mobile)
+                "user/get_userid", _account_id=account_id or self._account_id, mobile=str(mobile)
             )
 
         async def userid_to_openid(self, user_id: str, *, account_id: str = None) -> dict:
             """成员 userid 转 openid（红包/对外支付等场景，POST user/convert_to_openid）"""
             return await self._adapter.call_api(
-                "user/convert_to_openid", _account_id=account_id, userid=str(user_id)
+                "user/convert_to_openid", _account_id=account_id or self._account_id, userid=str(user_id)
             )
 
         async def openid_to_userid(self, openid: str, *, account_id: str = None) -> dict:
             """openid 转回成员 userid（POST user/convert_to_userid）"""
             return await self._adapter.call_api(
-                "user/convert_to_userid", _account_id=account_id, openid=str(openid)
+                "user/convert_to_userid", _account_id=account_id or self._account_id, openid=str(openid)
             )
 
         async def get_supported_actions(self) -> dict:
@@ -542,7 +554,9 @@ class WeComAdapter(BaseAdapter):
         :param endpoint: 接口路径，如 "message/send" 或完整 URL
         :param _account_id: 账户名
         """
-        account_name, account = self._resolve_account(_account_id)
+                # 标准字段 account_id 与旧名 _account_id 双兼容（ApiDSL.Using 传标准名）
+        account_id = params.pop("account_id", None) or _account_id
+        account_name, account = self._resolve_account(account_id)
         echo = params.pop("echo", None)
 
         ok, token = await self._get_access_token(account_name)
@@ -590,7 +604,7 @@ class WeComAdapter(BaseAdapter):
 
         if not isinstance(raw_response, dict):
             err = self.make_error(
-                retcode=34000,
+                retcode=34100,
                 message=f"API 返回了意外格式: {type(raw_response)}",
                 raw=raw_response,
             )
@@ -609,7 +623,7 @@ class WeComAdapter(BaseAdapter):
 
         resp_obj = self.make_response(
             status="ok" if is_ok else "failed",
-            retcode=0 if is_ok else errcode,
+            retcode=0 if is_ok else 34100,
             data=raw_response,
             message_id=message_id,
             message="" if is_ok else raw_response.get("errmsg", "Unknown error"),
@@ -665,7 +679,7 @@ class WeComAdapter(BaseAdapter):
         )
         if not payloads:
             return self.make_error(
-                retcode=34000,
+                retcode=10003,
                 message="无法从消息段构建企业微信消息",
                 raw=None,
             )
